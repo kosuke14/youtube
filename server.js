@@ -228,6 +228,8 @@ function handleDownload(requestId, url, format, ws) {
 
   const formatArgs = getFormatArgs(format);
   const args = [
+//    '--extractor-arg',
+//    'youtube:player_client=default,-tv_downgraded',
     '--no-playlist',
     ...formatArgs.ytDlpFormat,
     '-o', `${randomDir}/%(title)s.%(ext)s`,
@@ -381,6 +383,151 @@ app.get('/download/:dir/:file', (req, res) => {
     res.download(filePath);
   } else {
     res.status(404).send('File not found');
+  }
+});
+
+// Stream download endpoint - pipes video/audio directly without caching
+app.get('/stream', async (req, res) => {
+  try {
+    const { url, format } = req.query;
+
+    // Validate query parameters
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ error: 'URLが必要です' });
+    }
+
+    if (!format || !VALID_FORMATS.includes(format)) {
+      return res.status(400).json({ error: '無効な形式です' });
+    }
+
+    // Validate YouTube URL
+    try {
+      const urlObj = new URL(url);
+      const allowedHosts = ['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com'];
+      if (!allowedHosts.includes(urlObj.hostname)) {
+        return res.status(400).json({ error: 'YouTubeのURLのみ許可されています' });
+      }
+    } catch {
+      return res.status(400).json({ error: '不正なURLです' });
+    }
+
+    const skipLimitCheck = req.query.skip_limitcheck === 'true';
+    const DURATION_LIMIT_SECONDS = 30 * 60;
+
+    const formatArgs = getFormatArgs(format);
+    const args = [
+//      '--extractor-arg',
+ //     'youtube:player_client=default,-tv_downgraded',
+      '--no-playlist',
+      ...formatArgs.ytDlpFormat,
+      '-o', '-',
+      ...formatArgs.extraArgs || [],
+    ];
+
+    if (process.env.NO_CHECK_CERTIFICATES === 'true') {
+      args.push('--no-check-certificates');
+    }
+
+    if (fs.existsSync('cookie.txt')) {
+      try {
+        const stat = fs.statSync('cookie.txt');
+        const mode = stat.mode & 0o777;
+        if (mode > 0o600) {
+          console.warn('警告: cookie.txtのパーミッションが安全ではありません。chmod 600を推奨します。');
+        }
+        args.push('--cookies', 'cookie.txt');
+      } catch (e) {
+        console.warn('cookie.txtの読み込みに失敗しました:', e.message);
+      }
+    }
+
+    args.push(url);
+
+    const child = spawn('yt-dlp', args);
+    let stderrBuffer = '';
+
+    // Set appropriate content type based on format
+    const contentTypes = {
+      'mp4': 'video/mp4',
+      'mp4_720': 'video/mp4',
+      'mp4_480': 'video/mp4',
+      'mkv': 'video/x-matroska',
+      'mp3': 'audio/mpeg',
+      'mp3_128': 'audio/mpeg',
+      'wav': 'audio/wav',
+      'flac': 'audio/flac',
+      'aac': 'audio/aac',
+      'opus': 'audio/opus',
+    };
+
+    res.setHeader('Content-Type', contentTypes[format] || 'application/octet-stream');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    // Pipe yt-dlp stdout directly to response
+    child.stdout.pipe(res);
+
+    // Handle errors
+    child.stderr.on('data', (data) => {
+      stderrBuffer += data.toString();
+      //console.error('yt-dlp stderr:', data.toString());
+
+      if (!skipLimitCheck) {
+        const match = stderrBuffer.match(/Duration:\s*(\d+):(\d+):(\d+)/);
+        if (match) {
+          const totalSeconds = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseInt(match[3]);
+          if (totalSeconds > DURATION_LIMIT_SECONDS) {
+            console.warn(`動画の長さ(${totalSeconds}秒)が上限(${DURATION_LIMIT_SECONDS}秒)を超えているためダウンロードを中断します`);
+            try {
+              if (child.pid) {
+                process.kill(-child.pid, 'SIGTERM');
+              }
+            } catch (e) {
+            }
+            if (!res.headersSent) {
+              res.status(400).json({ error: '動画が30分を超えているためダウンロードできません' });
+            } else {
+              res.end();
+            }
+          }
+        }
+      }
+    });
+
+    child.on('error', (err) => {
+      console.error('yt-dlp error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'ダウンロードの起動に失敗しました' });
+      } else {
+        res.end();
+      }
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0 && !res.headersSent) {
+        res.status(500).json({ error: 'yt-dlpがエラーを返しました' });
+      }
+    });
+
+    // Handle client disconnect
+    res.on('close', () => {
+      try {
+        if (child.pid) {
+          process.kill(-child.pid, 'SIGTERM');
+        }
+      } catch (e) {
+      }
+    });
+
+  } catch (err) {
+    console.error('Stream download error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'リクエストの処理に失敗しました' });
+    } else {
+      res.end();
+    }
   }
 });
 
