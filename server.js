@@ -802,12 +802,22 @@ app.get('/stream', async (req, res) => {
       return res.status(400).json({ error: '無効な形式です' });
     }
 
-    // Validate YouTube URL
+    // Validate YouTube / nicovideo URL
+    let isNiconico = false;
     try {
       const urlObj = new URL(url);
-      const allowedHosts = ['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com'];
-      if (!allowedHosts.includes(urlObj.hostname)) {
-        return res.status(400).json({ error: 'YouTubeのURLのみ許可されています' });
+      const youtubeHosts = ['www.youtube.com', 'youtube.com', 'youtu.be', 'm.youtube.com'];
+      const niconicoHosts = [
+        'www.nicovideo.jp',
+        'nicovideo.jp',
+        'sp.nicovideo.jp',
+        'live.nicovideo.jp',
+        'ch.nicovideo.jp',
+        'nico.ms',
+      ];
+      isNiconico = niconicoHosts.includes(urlObj.hostname);
+      if (!isNiconico && !youtubeHosts.includes(urlObj.hostname)) {
+        return res.status(400).json({ error: 'YouTubeまたはニコニコ動画のURLのみ許可されています' });
       }
     } catch {
       return res.status(400).json({ error: '不正なURLです' });
@@ -817,9 +827,20 @@ app.get('/stream', async (req, res) => {
     const DURATION_LIMIT_SECONDS = 30 * 60;
 
     const formatArgs = getFormatArgs(format);
+
+    // nicovideoは音声がm4a以外(webm/opus)の場合があるため、音声のext指定を外した候補を追加する
+    if (isNiconico) {
+      const niconicoSelectors = {
+        'mp4': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best',
+        'mp4_720': 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720][ext=mp4]/best',
+        'mp4_480': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480][ext=mp4]+bestaudio/best[height<=480][ext=mp4]/best',
+      };
+      if (niconicoSelectors[format]) {
+        formatArgs.ytDlpFormat = ['-f', niconicoSelectors[format]];
+      }
+    }
+
     const args = [
-//      '--extractor-arg',
- //     'youtube:player_client=default,-tv_downgraded',
       '--no-playlist',
       ...formatArgs.ytDlpFormat,
       '-o', '-',
@@ -830,23 +851,45 @@ app.get('/stream', async (req, res) => {
       args.push('--no-check-certificates');
     }
 
-    if (fs.existsSync('cookie.txt')) {
+    // nicovideo: 配信URLの取得にリファラ指定が必要なため
+    if (isNiconico) {
+      args.push('--referer', 'https://www.nicovideo.jp/');
+    }
+
+    // cookieファイルの選択: nicovideoの場合はnicovideo.jp_cookie.txt、それ以外はcookie.txt(YouTube用)
+    const cookieFile = isNiconico ? 'nicovideo.jp_cookie.txt' : 'cookie.txt';
+    if (fs.existsSync(cookieFile)) {
       try {
-        const stat = fs.statSync('cookie.txt');
+        const stat = fs.statSync(cookieFile);
         const mode = stat.mode & 0o777;
         if (mode > 0o600) {
-          console.warn('警告: cookie.txtのパーミッションが安全ではありません。chmod 600を推奨します。');
+          console.warn(`警告: ${cookieFile}のパーミッションが安全ではありません。chmod 600を推奨します。`);
         }
-        args.push('--cookies', 'cookie.txt');
+        args.push('--cookies', cookieFile);
       } catch (e) {
-        console.warn('cookie.txtの読み込みに失敗しました:', e.message);
+        console.warn(`${cookieFile}の読み込みに失敗しました:`, e.message);
       }
+    } else if (isNiconico) {
+      console.warn('nicovideo.jp_cookie.txtが見つかりません。cookieなしでダウンロードを試みます。');
     }
 
     args.push(url);
 
     const child = spawn('yt-dlp', args);
     let stderrBuffer = '';
+
+    // 子プロセスを終了させる(プロセスグループ形成的でないためpid指定も試す)
+    const killChild = () => {
+      if (!child.pid) return;
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (e) {
+        try {
+          child.kill('SIGTERM');
+        } catch (e2) {
+        }
+      }
+    };
 
     // Set appropriate content type based on format
     const contentTypes = {
@@ -874,7 +917,7 @@ app.get('/stream', async (req, res) => {
     // Handle errors
     child.stderr.on('data', (data) => {
       stderrBuffer += data.toString();
-      //console.error('yt-dlp stderr:', data.toString());
+      console.error('yt-dlp stderr:', data.toString());
 
       if (!skipLimitCheck) {
         const match = stderrBuffer.match(/Duration:\s*(\d+):(\d+):(\d+)/);
@@ -882,12 +925,7 @@ app.get('/stream', async (req, res) => {
           const totalSeconds = parseInt(match[1]) * 3600 + parseInt(match[2]) * 60 + parseInt(match[3]);
           if (totalSeconds > DURATION_LIMIT_SECONDS) {
             console.warn(`動画の長さ(${totalSeconds}秒)が上限(${DURATION_LIMIT_SECONDS}秒)を超えているためダウンロードを中断します`);
-            try {
-              if (child.pid) {
-                process.kill(-child.pid, 'SIGTERM');
-              }
-            } catch (e) {
-            }
+            killChild();
             if (!res.headersSent) {
               res.status(400).json({ error: '動画が30分を超えているためダウンロードできません' });
             } else {
@@ -915,12 +953,7 @@ app.get('/stream', async (req, res) => {
 
     // Handle client disconnect
     res.on('close', () => {
-      try {
-        if (child.pid) {
-          process.kill(-child.pid, 'SIGTERM');
-        }
-      } catch (e) {
-      }
+      killChild();
     });
 
   } catch (err) {
