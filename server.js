@@ -13,7 +13,7 @@ const urlList = require('./public/url_list.json');
 
 const app = express();
 const port = 3020;
-const wss = new WebSocket.Server({ noServer: true, maxPayload: 10 * 1024 });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: 1024 * 1024 });
 
 // Worker設定（環境変数で調整可能、デフォルトは2）
 const MAX_CONCURRENT_DOWNLOADS = parseInt(process.env.MAX_WORKERS) || 2;
@@ -21,7 +21,7 @@ const RESERVED_SPACE_GB = parseFloat(process.env.RESERVED_SPACE_GB) || 5;
 
 // セキュリティ設定
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
-const RATE_LIMIT_MAX_REQUESTS = 100; // 緩和
+const RATE_LIMIT_MAX_REQUESTS = 1500; // 緩和
 const WS_RATE_LIMIT_WINDOW_MS = 10 * 1000;
 const WS_RATE_LIMIT_MAX_MESSAGES = 20;
 const requestCounts = new Map();
@@ -52,7 +52,7 @@ app.use(helmet({
       "script-src": ["'self'", "'unsafe-inline'", "https:"],
       "script-src-attr": ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      "connect-src": ["'self'", 'ws:', 'wss:', 'http:', 'https:'],
+      "connect-src": ["'self'", 'ws:', 'wss:', 'http:', 'https:', ...allowedWsDomains],
       imgSrc: ["'self'", 'data:', 'https:', 'http:'],
       mediaSrc: ["'self'"],
       fontSrc: ["'self'"],
@@ -67,7 +67,7 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   dnsPrefetchControl: { allow: false },
   frameguard: { action: "deny" },
-  hsts: { maxAge: 31536000, includeSubDomains: true, preload: true },
+  hsts: false,
   ieNoOpen: true,
   noSniff: true,
   referrerPolicy: { policy: "strict-origin-when-cross-origin" },
@@ -532,13 +532,14 @@ function extractVideoId(url) {
 function getVideoInfo(url) {
   return new Promise((resolve, reject) => {
     const args = [
+      '--js-runtimes', 'node',
       '--dump-json',
       '--no-playlist',
       '--no-download',
       url
     ];
 
-    const child = spawn('yt-dlp', args);
+    const child = spawn('./yt-dlp-bin', args);
     let output = '';
     let errorOutput = '';
 
@@ -548,6 +549,7 @@ function getVideoInfo(url) {
 
     child.stderr.on('data', (data) => {
       errorOutput += data.toString();
+      console.error('yt-dlp stderr (getVideoInfo):', data.toString());
     });
 
     child.on('close', (code) => {
@@ -565,14 +567,17 @@ function getVideoInfo(url) {
             uploadDate: info.upload_date
           });
         } catch (e) {
+          console.error('JSONパースエラー (getVideoInfo):', e.message, 'Output:', output);
           reject(new Error('JSONパースエラー'));
         }
       } else {
+        console.error('yt-dlp failed (getVideoInfo) with code:', code, 'stderr:', errorOutput);
         reject(new Error(errorOutput || '動画情報の取得に失敗'));
       }
     });
 
     child.on('error', (err) => {
+      console.error('yt-dlp spawn error (getVideoInfo):', err);
       reject(err);
     });
   });
@@ -590,6 +595,7 @@ function startDownload(requestId, url, format, ws) {
 
   const formatArgs = getFormatArgs(format);
   const args = [
+    '--js-runtimes', 'node',
 //    '--extractor-arg',
 //    'youtube:player_client=default,-tv_downgraded',
     '--no-playlist',
@@ -618,7 +624,7 @@ function startDownload(requestId, url, format, ws) {
     }
   }
 
-  const child = spawn('yt-dlp', args, { detached: true });
+  const child = spawn('./yt-dlp-bin', args, { detached: true });
 
   activeDownloads.set(requestId, { child, randomDir, stopped: false });
 
@@ -1011,12 +1017,17 @@ app.get('/fetch-channel-playlists', async (req, res) => {
 });
 
 const server = app.listen(port, () => {
-  console.log(`Secure Server is running on http://localhost:${port}`);
+  console.log(`Server is running on http://localhost:${port}`);
 });
 
 // WebSocket upgradeハンドラ（originチェック無効化）
 server.on('upgrade', (req, socket, head) => {
+  console.log('🔍 WebSocket upgrade request received!');
+  console.log('   URL:', req.url);
+  console.log('   Headers:', req.headers);
+
   wss.handleUpgrade(req, socket, head, (ws) => {
+    console.log('✅ WebSocket connection accepted!');
     wss.emit('connection', ws, req);
   });
 });
